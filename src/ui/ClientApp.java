@@ -51,6 +51,8 @@ public class ClientApp extends JFrame {
         setLocationRelativeTo(null);
         setResizable(true);
 
+        registerShutdownHook();
+
         JPanel root = new JPanel(new BorderLayout(0, 0));
         root.setBackground(C_BG);
         root.add(buildHeader(),  BorderLayout.NORTH);
@@ -58,6 +60,33 @@ public class ClientApp extends JFrame {
         root.add(buildButtons(), BorderLayout.SOUTH);
         setContentPane(root);
         setVisible(true);
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  SHUTDOWN HOOK — Cierre por proceso externo
+    // ════════════════════════════════════════════════════════
+    /**
+     * Se ejecuta cuando el proceso es terminado externamente:
+     * Administrador de Tareas, Ctrl+C, kill, cierre del SO.
+     * Desconecta todos los clientes limpiamente antes de morir.
+     */
+    private void registerShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+            if (logArea != null) {
+                logArea.append("\n[" + time + "]  ⚠ PROCESO TERMINADO EXTERNAMENTE\n");
+                logArea.append("[" + time + "]  ⚠ (Administrador de Tareas / Ctrl+C / kill)\n");
+                logArea.append("[" + time + "]  → Desconectando " + clients.size() + " cliente(s)...\n");
+            }
+            System.out.println("[" + time + "] [ShutdownHook] Proceso de clientes terminado externamente.");
+
+            for (TCPClient c : clients) c.disconnect();
+
+            if (logArea != null)
+                logArea.append("[" + time + "]  ✔ Clientes desconectados. Proceso cerrado.\n");
+            System.out.println("[ShutdownHook] Clientes desconectados. Proceso cerrado.");
+            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+        }, "ShutdownHook-Client"));
     }
 
     // ── Cabecera ─────────────────────────────────────────────

@@ -10,6 +10,13 @@ import java.util.function.Consumer;
  * Servidor TCP.
  * - Acepta múltiples clientes.
  * - Aplica la RestartPolicy cuando se cae o es detenido externamente.
+ *
+ * CORRECCIONES:
+ *  - Bug 1: onStopped solo se invoca al final del ciclo completo (no en cada
+ *           cierre temporal durante AUTO_RESTART), evitando que la UI se
+ *           desincronice mostrando OFFLINE mientras el servidor se reinicia.
+ *  - Bug 1b: onStarted se invoca en cada (re)inicio para que la UI refleje
+ *            correctamente el estado ONLINE tras cada reinicio automático.
  */
 public class TCPServer {
 
@@ -48,6 +55,17 @@ public class TCPServer {
         stopped = true;
         running = false;
         closeSocket();
+    }
+
+    /**
+     * Simula una caída inesperada del servidor.
+     * NO marca stopped=true, por lo que la RestartPolicy decide si reiniciar.
+     * - NO_RESTART   → el servidor se queda apagado.
+     * - AUTO_RESTART → el servidor se reinicia automáticamente tras el delay.
+     */
+    public void crash() {
+        running = false;
+        closeSocket();   // cierre brusco, sin tocar 'stopped'
     }
 
     // ── Ciclo de vida con política de reinicio ────────────────
