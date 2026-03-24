@@ -26,6 +26,8 @@ public class TCPClientBalanced {
     private volatile boolean active           = false;
     private volatile boolean hasConnectedOnce = false; // true tras la primera conexión exitosa
     private volatile String  connectedServer  = ""; // "S01:8080" o ""
+    private volatile int     lastPort         = -1;  // puerto del servidor al que estaba conectado
+    private volatile String  lastSrvId        = "";  // id del servidor al que estaba conectado
     private Socket socket;
 
     private Consumer<State>           onStateChange;
@@ -73,25 +75,41 @@ public class TCPClientBalanced {
         while (active) {
             setState(State.CONNECTING);
 
-            // Si ya había conectado antes y la política es Sin reinicio,
-            // no tiene sentido redirigir a otro servidor: el cliente falla directamente.
-            int[] info;
-            if (hasConnectedOnce && !allowRedirect) {
-                info = null; // fuerza fallo sin consultar el balanceador
-                log.accept("[" + id + "] ✖ Conexión perdida y política Sin reinicio. No se redirige.");
-            } else {
-                info = serverSupplier.get();
-            }
+            int port;
+            String srvId;
 
-            int    port  = (info != null) ? info[0] : -1;
-            String srvId = (info != null && info.length > 1)
-                    ? "S" + String.format("%02d", info[1] + 1) : "";
-
-            if (port == -1 && !(hasConnectedOnce && !allowRedirect)) {
-                log.accept("[" + id + "] ✖ No hay servidores disponibles.");
-            } else if (port != -1) {
-                log.accept("[" + id + "] Intentando conectar a " + srvId
+            if (hasConnectedOnce && allowRedirect) {
+                // Con reinicio automático: vuelve a intentar con el mismo servidor,
+                // no consulta el balanceador para no cambiar de servidor.
+                port  = lastPort;
+                srvId = lastSrvId;
+                log.accept("[" + id + "] Reintentando reconectar a " + srvId
                         + " (" + host + ":" + port + ")  timeout=" + policy.getTimeoutSecs() + "s");
+            } else if (hasConnectedOnce && !allowRedirect) {
+                // Sin reinicio: el servidor caído no va a volver,
+                // consulta el balanceador para ir a otro disponible.
+                int[] info = serverSupplier.get();
+                port  = (info != null) ? info[0] : -1;
+                srvId = (info != null && info.length > 1)
+                        ? "S" + String.format("%02d", info[1] + 1) : "";
+                if (port == -1) {
+                    log.accept("[" + id + "] ✖ No hay servidores disponibles.");
+                } else {
+                    log.accept("[" + id + "] Redirigiendo a " + srvId
+                            + " (" + host + ":" + port + ")  timeout=" + policy.getTimeoutSecs() + "s");
+                }
+            } else {
+                // Primera conexión: consulta el balanceador normalmente (Round Robin).
+                int[] info = serverSupplier.get();
+                port  = (info != null) ? info[0] : -1;
+                srvId = (info != null && info.length > 1)
+                        ? "S" + String.format("%02d", info[1] + 1) : "";
+                if (port == -1) {
+                    log.accept("[" + id + "] ✖ No hay servidores disponibles.");
+                } else {
+                    log.accept("[" + id + "] Intentando conectar a " + srvId
+                            + " (" + host + ":" + port + ")  timeout=" + policy.getTimeoutSecs() + "s");
+                }
             }
 
             boolean wasConnected = false;
@@ -103,6 +121,8 @@ public class TCPClientBalanced {
 
                     wasConnected     = true;
                     hasConnectedOnce = true;
+                    lastPort         = port;
+                    lastSrvId        = srvId;
                     connectedServer  = srvId + ":" + port;
                     policy.reset();
                     setState(State.CONNECTED);
@@ -123,7 +143,7 @@ public class TCPClientBalanced {
                     closeSocket();
                     if (wasConnected && active) {
                         log.accept("[" + id + "] Conexión perdida con " + srvId
-                                + (allowRedirect ? ". Buscando servidor disponible..." : ". Sin reinicio, no se redirige."));
+                                + (allowRedirect ? ". Esperando que " + srvId + " vuelva..." : ". Buscando otro servidor..."));
                         connectedServer = "";
                         notifyServer("");
                     }

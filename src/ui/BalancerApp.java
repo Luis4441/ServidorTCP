@@ -536,7 +536,7 @@ public class BalancerApp extends JFrame {
                     id, "localhost", pol,
                     this::logClient,
                     () -> balancer.nextAvailable(),
-                    autoPolicy   // allowRedirect: solo redirige si hay reinicio automático
+                    autoPolicy   // allowRedirect=true: con reinicio automático (vuelve al mismo servidor)
             );
 
             JPanel card = buildCard(id);
