@@ -7,26 +7,26 @@ import java.util.concurrent.*;
 import java.util.function.Consumer;
 
 /**
- * Servidor TCP.
- * - Acepta múltiples clientes.
- * - Aplica la RestartPolicy cuando se cae o es detenido externamente.
+ * Servidor TCP — escucha una sola vez y notifica cuando cae.
  *
- * CORRECCIONES:
- *  - Bug 1: onStopped solo se invoca al final del ciclo completo (no en cada
- *           cierre temporal durante AUTO_RESTART), evitando que la UI se
- *           desincronice mostrando OFFLINE mientras el servidor se reinicia.
- *  - Bug 1b: onStarted se invoca en cada (re)inicio para que la UI refleje
- *            correctamente el estado ONLINE tras cada reinicio automático.
+ * La lógica de reinicio (cuántas veces, cada cuánto) la maneja
+ * ServerApp, igual que ClientApp maneja los reintentos de TCPClient.
+ * TCPServer solo sabe arrancar, aceptar clientes, y parar.
+ *
+ * Métodos clave:
+ *   start()  → arranca en hilo propio, llama onStarted al estar listo.
+ *   stop()   → parada limpia (stopped=true), llama onStopped al terminar.
+ *   crash()  → caída brusca (stopped=false), llama onStopped al terminar.
+ *              ServerApp distingue stop vs crash para decidir si reabrir.
  */
 public class TCPServer {
 
     private final int              port;
-    private final RestartPolicy    policy;
     private final Consumer<String> log;
 
     private ServerSocket     serverSocket;
     private volatile boolean running = false;
-    private volatile boolean stopped = false;  // detenido a propósito por el usuario
+    private volatile boolean stopped = false;
 
     private final List<Socket>    clients = Collections.synchronizedList(new ArrayList<>());
     private final ExecutorService pool    = Executors.newCachedThreadPool();
@@ -34,23 +34,21 @@ public class TCPServer {
     private Runnable onStarted;
     private Runnable onStopped;
 
-    public TCPServer(int port, RestartPolicy policy, Consumer<String> log) {
-        this.port   = port;
-        this.policy = policy;
-        this.log    = log;
+    public TCPServer(int port, Consumer<String> log) {
+        this.port = port;
+        this.log  = log;
     }
 
     public void setOnStarted(Runnable r) { this.onStarted = r; }
     public void setOnStopped(Runnable r) { this.onStopped = r; }
 
-    /** Inicia el servidor en un hilo independiente. */
+    /** Arranca el servidor en un hilo independiente. */
     public void start() {
         stopped = false;
-        policy.reset();
-        new Thread(this::lifecycle, "Server-Main").start();
+        new Thread(this::listen, "Server-Listen").start();
     }
 
-    /** Detiene el servidor manualmente (sin reinicio). */
+    /** Parada limpia — stopped=true, ServerApp NO reabrirá la ventana. */
     public void stop() {
         stopped = true;
         running = false;
@@ -58,56 +56,23 @@ public class TCPServer {
     }
 
     /**
-     * Simula una caída inesperada del servidor.
-     * NO marca stopped=true, por lo que la RestartPolicy decide si reiniciar.
-     * - NO_RESTART   → el servidor se queda apagado.
-     * - AUTO_RESTART → el servidor se reinicia automáticamente tras el delay.
+     * Caída brusca — stopped=false.
+     * ServerApp detecta wasManualStop=false en onStopped y decide
+     * si reabrir la ventana según la RestartPolicy configurada en la UI.
      */
     public void crash() {
         running = false;
-        closeSocket();   // cierre brusco, sin tocar 'stopped'
+        closeSocket();
     }
 
-    // ── Ciclo de vida con política de reinicio ────────────────
-    //
-    // FIX Bug 1: onStopped se mueve FUERA de listen() y se llama
-    // únicamente aquí, al terminar el ciclo completo. Así la UI no
-    // parpadea a OFFLINE en cada reinicio automático.
-    private void lifecycle() {
-        do {
-            listen();                          // bloquea hasta que el servidor se cae
+    public boolean wasStopped() { return stopped; }  // ServerApp lo consulta en onStopped
 
-            if (stopped) break;               // parada manual → no reiniciar
-
-            if (policy.shouldRestart()) {
-                policy.countRestart();
-                int d = policy.getDelaySeconds();
-                log.accept("⟳ Reiniciando en " + d + "s  (intento "
-                        + policy.getRestartCount() + "/" + policy.getMaxRestarts() + ")...");
-                try { Thread.sleep(policy.getDelayMs()); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-            } else {
-                log.accept("✖ Política NO_RESTART: el servidor no se reiniciará.");
-                break;
-            }
-        } while (!stopped);
-
-        // ← onStopped se llama UNA SOLA VEZ al final del ciclo completo
-        if (onStopped != null) onStopped.run();
-    }
-
-    // ── Escucha activa (un "ciclo" de vida del socket) ────────
-    //
-    // FIX Bug 1b: onStarted se invoca aquí (dentro de listen) para que
-    // se dispare en CADA arranque/reinicio, no solo el primero.
-    // Ya NO se llama a onStopped desde el finally; lo gestiona lifecycle().
+    // ── Escucha ───────────────────────────────────────────────
     private void listen() {
         try {
             serverSocket = new ServerSocket(port);
             running = true;
             log.accept("✔ Servidor escuchando en puerto " + port);
-
-            // Notificar UI que está ONLINE (también en reinicios automáticos)
             if (onStarted != null) onStarted.run();
 
             while (running) {
@@ -129,7 +94,7 @@ public class TCPServer {
             running = false;
             disconnectAll();
             log.accept("◼ Servidor detenido.");
-            // ← onStopped ya NO se llama aquí
+            if (onStopped != null) onStopped.run();
         }
     }
 

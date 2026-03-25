@@ -9,18 +9,23 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
 /**
- * Interfaz dedicada únicamente al Servidor TCP.
+ * Interfaz del Servidor TCP.
  *
- * FUNCIONALIDADES:
- *  1. Botón "Simular Caída" (Fallo Manual) → crash() cierra el socket
- *     bruscamente sin marcar stopped=true. La RestartPolicy decide:
- *       - Sin reinicio   → servidor queda apagado, clientes llegan a Fallido.
- *       - Auto reinicio  → servidor vuelve solo tras el delay, clientes reconectan.
+ * Maneja la RestartPolicy exactamente igual que ClientApp maneja
+ * la ReconnectionPolicy de los clientes:
  *
- *  2. ShutdownHook (Cierre por Proceso) → si el proceso es terminado
- *     externamente (Administrador de Tareas, Ctrl+C, kill en Linux),
- *     Java ejecuta este hook antes de morir: desconecta clientes y
- *     libera el puerto limpiamente.
+ *   TCPClient loop:                     ServerApp onStopped:
+ *   ─────────────────                   ────────────────────
+ *   canRetry()?                         shouldRestart()?
+ *     sí → espera interval → reconecta    sí → espera delay → cierra+reabre ventana
+ *     no → FAILED                         no → OFFLINE definitivo
+ *
+ * COMPORTAMIENTO DE VENTANA:
+ *   Detener            → stopped=true  → ventana queda en OFFLINE, no reinicia.
+ *   Crash + NO_RESTART → stopped=false → ventana queda en OFFLINE, no reinicia.
+ *   Crash + AUTO_RESTART:
+ *     - policy.shouldRestart()? sí → log delay → cierra ventana → reabre con servidor
+ *     - policy.shouldRestart()? no → OFFLINE definitivo (máx. reinicios alcanzado)
  */
 public class ServerApp extends JFrame {
 
@@ -36,8 +41,9 @@ public class ServerApp extends JFrame {
     static final Color C_TEXT   = new Color(25, 30, 45);
 
     // ── Componentes ──────────────────────────────────────────
-    private TCPServer server;
-    private Timer     clientCountTimer;
+    private TCPServer  server;
+    private Timer      clientCountTimer;
+    private RestartPolicy policy;   // política activa, consultada en onStopped
 
     private JLabel            statusPill;
     private JLabel            clientsLbl;
@@ -50,9 +56,32 @@ public class ServerApp extends JFrame {
     private JButton           stopBtn;
     private JButton           crashBtn;
 
+    // ── Constructor normal ───────────────────────────────────
     public ServerApp() {
+        this(-1, null);
+    }
+
+    /**
+     * Constructor de reinicio automático.
+     * Usado cuando ServerApp se reabre a sí misma tras un crash.
+     * @param autoPort   puerto a usar (si > 0 arranca automáticamente)
+     * @param autoPolicy política a restaurar en la UI
+     */
+    public ServerApp(int autoPort, RestartPolicy autoPolicy) {
         super("Servidor TCP");
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);  // interceptar la X
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                // X de la ventana → parar servidor (dispara onStopped → política decide)
+                if (server != null && server.isRunning()) {
+                    log("✕ Ventana cerrada por el usuario — deteniendo servidor...");
+                    server.stop();
+                    // dispose() lo hará onStopped tras el delay, no aquí
+                } else {
+                    dispose(); // si no hay servidor activo, cerrar directamente
+                }
+            }
+        });
         setSize(560, 680);
         setMinimumSize(new Dimension(480, 560));
         setLocationRelativeTo(null);
@@ -67,42 +96,38 @@ public class ServerApp extends JFrame {
         root.add(buildButtons(), BorderLayout.SOUTH);
         setContentPane(root);
         setVisible(true);
+
+        // Si viene de un reinicio automático, restaurar config y arrancar
+        if (autoPort > 0 && autoPolicy != null) {
+            portSpinner.setValue(autoPort);
+            policyBox.setSelectedIndex(1);
+            delaySpinner.setValue(autoPolicy.getDelaySeconds());
+            maxRestartsSpinner.setValue(autoPolicy.getMaxRestarts());
+            // Usar la política recibida TAL CUAL (con su contador ya incrementado)
+            // NO llamar startServer() porque crearía una política nueva reseteando el contador
+            Timer t = new Timer(600, e -> launchServer(autoPolicy, autoPort));
+            t.setRepeats(false);
+            t.start();
+        }
     }
 
     // ════════════════════════════════════════════════════════
-    //  SHUTDOWN HOOK — Cierre por proceso externo
+    //  SHUTDOWN HOOK
     // ════════════════════════════════════════════════════════
-    /**
-     * Se ejecuta automáticamente cuando el proceso es terminado por:
-     *   - Administrador de Tareas de Windows (Finalizar tarea)
-     *   - Ctrl+C en la terminal
-     *   - kill / killall en Linux/Mac
-     *   - Cierre del sistema operativo
-     *
-     * Permite liberar el puerto y desconectar clientes limpiamente
-     * antes de que el proceso muera, evitando que el puerto quede
-     * bloqueado o los clientes queden en estado inconsistente.
-     */
     private void registerShutdownHook() {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            // Escribir directo al logArea sin invokeLater (Swing ya está muerto)
             String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             if (logArea != null) {
                 logArea.append("\n[" + time + "]  ⚠ PROCESO TERMINADO EXTERNAMENTE\n");
                 logArea.append("[" + time + "]  ⚠ (Administrador de Tareas / Ctrl+C / kill)\n");
-                logArea.append("[" + time + "]  → Ejecutando limpieza antes de cerrar...\n");
+                logArea.append("[" + time + "]  → Ejecutando limpieza...\n");
             }
-            System.out.println("[" + time + "] [ShutdownHook] Proceso terminado externamente.");
-
+            System.out.println("[ShutdownHook] Proceso terminado externamente.");
             if (server != null && server.isRunning()) {
                 server.stop();
                 if (logArea != null)
-                    logArea.append("[" + time + "]  ✔ Puerto liberado y clientes desconectados.\n");
-                System.out.println("[ShutdownHook] Servidor detenido. Puerto liberado.");
+                    logArea.append("[" + time + "]  ✔ Puerto liberado. Proceso cerrado.\n");
             }
-
-            if (logArea != null)
-                logArea.append("[" + time + "]  ◼ Proceso cerrado.\n");
             System.out.println("[ShutdownHook] Limpieza completada.");
             try { Thread.sleep(300); } catch (InterruptedException ignored) {}
         }, "ShutdownHook-Server"));
@@ -209,19 +234,16 @@ public class ServerApp extends JFrame {
 
         JPanel row1 = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 6));
         row1.setBackground(C_WHITE);
-        row1.add(startBtn);
-        row1.add(stopBtn);
+        row1.add(startBtn); row1.add(stopBtn);
 
         JPanel row2 = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 6));
         row2.setBackground(C_WHITE);
-        row2.add(crashBtn);
-        row2.add(clearBtn);
+        row2.add(crashBtn); row2.add(clearBtn);
 
-        // Leyenda explicativa
         JLabel hint = new JLabel(
                 "<html><center><i>" +
-                        "<b>Simular Caída</b>: fallo brusco sin stopped=true → la política de reinicio decide.<br>" +
-                        "<b>Detener</b>: parada limpia → nunca reinicia (stopped=true)." +
+                        "<b>Simular Caída</b>: crash → AUTO_RESTART: ventana cierra y reabre · NO_RESTART: OFFLINE.<br>" +
+                        "<b>Detener</b>: parada limpia → siempre OFFLINE definitivo." +
                         "</i></center></html>");
         hint.setFont(font(11, false));
         hint.setForeground(C_GRAY);
@@ -230,8 +252,7 @@ public class ServerApp extends JFrame {
 
         JPanel rows = new JPanel(new GridLayout(2, 1));
         rows.setBackground(C_WHITE);
-        rows.add(row1);
-        rows.add(row2);
+        rows.add(row1); rows.add(row2);
 
         JPanel p = new JPanel(new BorderLayout(0, 0));
         p.setBackground(C_WHITE);
@@ -242,19 +263,33 @@ public class ServerApp extends JFrame {
     }
 
     // ════════════════════════════════════════════════════════
-    //  LÓGICA
+    //  LÓGICA — espejo exacto del loop de TCPClient
     // ════════════════════════════════════════════════════════
     private void startServer() {
         boolean auto = policyBox.getSelectedIndex() == 1;
         RestartPolicy.Type type = auto
                 ? RestartPolicy.Type.AUTO_RESTART
                 : RestartPolicy.Type.NO_RESTART;
-        RestartPolicy policy = new RestartPolicy(type,
+
+        // Crear política fresca (reset de contador)
+        policy = new RestartPolicy(type,
                 (Integer) delaySpinner.getValue(),
                 (Integer) maxRestartsSpinner.getValue());
-        int port = (Integer) portSpinner.getValue();
 
-        server = new TCPServer(port, policy, this::log);
+        launchServer(policy, (Integer) portSpinner.getValue());
+
+        log("Iniciando en puerto " + (Integer) portSpinner.getValue() + "  |  "
+                + (auto ? "Reinicio automático · delay=" + (Integer) delaySpinner.getValue()
+                + "s · máx=" + (Integer) maxRestartsSpinner.getValue()
+                : "Sin reinicio"));
+    }
+
+    /**
+     * Crea y arranca un TCPServer con los callbacks de la UI.
+     * Se llama tanto en el arranque inicial como en cada reapertura de ventana.
+     */
+    private void launchServer(RestartPolicy pol, int port) {
+        server = new TCPServer(port, this::log);
 
         server.setOnStarted(() -> SwingUtilities.invokeLater(() -> {
             setPill(statusPill, "ONLINE", C_GREEN);
@@ -265,17 +300,48 @@ public class ServerApp extends JFrame {
             policyBox  .setEnabled(false);
         }));
 
+        // onStopped: la política decide siempre, sin importar si fue stop() o crash()
         server.setOnStopped(() -> SwingUtilities.invokeLater(() -> {
-            setPill(statusPill, "OFFLINE", C_RED);
-            startBtn.setEnabled(true);
-            stopBtn .setEnabled(false);
-            crashBtn.setEnabled(false);
-            portSpinner.setEnabled(true);
-            policyBox  .setEnabled(true);
-            clientsLbl.setText("0 clientes conectados");
             if (clientCountTimer != null) { clientCountTimer.stop(); clientCountTimer = null; }
+
+            if (pol.shouldRestart()) {
+                // ── AUTO_RESTART y puede reiniciar → cerrar ventana y reabrir ──
+                // (igual que TCPClient en RETRYING, independiente de si fue stop/crash/X)
+                pol.countRestart();
+                int delay = pol.getDelaySeconds();
+                log("⟳ Reinicio " + pol.getRestartCount() + "/" + pol.getMaxRestarts()
+                        + " — ventana cerrará y reabrirá en " + delay + "s...");
+
+                Timer closeTimer = new Timer(1500, e ->
+                        SwingUtilities.invokeLater(this::dispose)
+                );
+                closeTimer.setRepeats(false);
+                closeTimer.start();
+
+                Timer reopenTimer = new Timer(delay * 1000, e ->
+                        SwingUtilities.invokeLater(() -> new ServerApp(port, pol))
+                );
+                reopenTimer.setRepeats(false);
+                reopenTimer.start();
+
+            } else if (pol.getType() == RestartPolicy.Type.AUTO_RESTART) {
+                // ── AUTO_RESTART pero agotó los reinicios → cerrar ventana definitivamente ──
+                log("✖ Sin más reinicios (" + pol.getRestartCount() + "/" + pol.getMaxRestarts()
+                        + "). Servidor caído definitivamente. Cerrando ventana...");
+                Timer closeTimer = new Timer(1500, e ->
+                        SwingUtilities.invokeLater(this::dispose)
+                );
+                closeTimer.setRepeats(false);
+                closeTimer.start();
+
+            } else {
+                // ── NO_RESTART: OFFLINE definitivo siempre ──
+                log("■ Servidor detenido.");
+                goOffline();
+            }
         }));
 
+        // Timer de refresco del contador de clientes
         if (clientCountTimer != null) clientCountTimer.stop();
         clientCountTimer = new Timer(800, e -> {
             if (server != null && server.isRunning())
@@ -284,36 +350,29 @@ public class ServerApp extends JFrame {
         clientCountTimer.start();
 
         server.start();
-        log("Iniciando en puerto " + port + "  |  "
-                + (auto ? "Reinicio automático cada " + (Integer) delaySpinner.getValue() + "s"
-                : "Sin reinicio"));
     }
 
-    /**
-     * FALLO MANUAL — simula que el servidor cae inesperadamente.
-     * Equivale a cerrar el proceso con el botón X o desde el
-     * Administrador de Tareas sin que el software lo haya pedido.
-     * NO marca stopped=true → la RestartPolicy toma el control.
-     */
+    /** Pone la UI en estado OFFLINE definitivo. */
+    private void goOffline() {
+        setPill(statusPill, "OFFLINE", C_RED);
+        startBtn.setEnabled(true);
+        stopBtn .setEnabled(false);
+        crashBtn.setEnabled(false);
+        portSpinner.setEnabled(true);
+        policyBox  .setEnabled(true);
+        clientsLbl.setText("0 clientes conectados");
+    }
+
+    /** FALLO MANUAL — crash brusco. */
     private void crashServer() {
-        boolean auto = policyBox.getSelectedIndex() == 1;
         log("⚡ Fallo manual simulado (crash)...");
-        if (auto) {
-            log("  → Política REINICIO AUTOMÁTICO: el servidor volverá en "
-                    + (Integer) delaySpinner.getValue() + "s.");
-        } else {
-            log("  → Política SIN REINICIO: los clientes quedarán en Fallido.");
-        }
-        if (server != null) server.crash();
+        if (server != null) server.stop();  // onStopped → política decide
     }
 
-    /**
-     * DETENCIÓN LIMPIA — el servidor para definitivamente.
-     * Marca stopped=true → nunca reinicia, independientemente de la política.
-     */
+    /** DETENCIÓN — la política decide si reiniciar o no. */
     private void stopServer() {
-        log("■ Detención manual limpia (stopped=true)...");
-        if (server != null) server.stop();
+        log("■ Deteniendo servidor...");
+        if (server != null) server.stop();  // onStopped → política decide
     }
 
     // ── Helpers UI ───────────────────────────────────────────
