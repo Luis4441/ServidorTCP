@@ -1,5 +1,6 @@
 package ui;
 
+import balancer.BalancerClient;
 import client.*;
 
 import javax.swing.*;
@@ -10,13 +11,8 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Interfaz dedicada únicamente a los Clientes TCP.
- * Ejecutar esta clase de forma independiente a ServerApp.
- */
 public class ClientApp extends JFrame {
 
-    // ── Colores ──────────────────────────────────────────────
     static final Color C_WHITE  = Color.WHITE;
     static final Color C_BG     = new Color(245, 247, 250);
     static final Color C_BORDER = new Color(200, 205, 215);
@@ -27,18 +23,18 @@ public class ClientApp extends JFrame {
     static final Color C_ORANGE = new Color(220, 120, 20);
     static final Color C_GRAY   = new Color(120, 125, 135);
     static final Color C_TEXT   = new Color(25, 30, 45);
+    static final Color C_TEAL   = new Color(20, 150, 160);
 
-    // ── Estado ───────────────────────────────────────────────
     private final List<TCPClient> clients = new ArrayList<>();
     private int clientCounter = 0;
 
-    // ── Componentes ──────────────────────────────────────────
     private JTextField        hostField;
     private JSpinner          portSpinner;
     private JSpinner          numSpinner;
     private JSpinner          retriesSpinner;
     private JSpinner          intervalSpinner;
     private JSpinner          timeoutSpinner;
+    private JCheckBox         useBalancerCheck;
     private JPanel            cardsPanel;
     private JTextArea         logArea;
     private JLabel            summaryLbl;
@@ -46,8 +42,8 @@ public class ClientApp extends JFrame {
     public ClientApp() {
         super("Clientes TCP");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setSize(600, 680);
-        setMinimumSize(new Dimension(500, 560));
+        setSize(620, 720);
+        setMinimumSize(new Dimension(520, 580));
         setLocationRelativeTo(null);
         setResizable(true);
 
@@ -62,34 +58,13 @@ public class ClientApp extends JFrame {
         setVisible(true);
     }
 
-    // ════════════════════════════════════════════════════════
-    //  SHUTDOWN HOOK — Cierre por proceso externo
-    // ════════════════════════════════════════════════════════
-    /**
-     * Se ejecuta cuando el proceso es terminado externamente:
-     * Administrador de Tareas, Ctrl+C, kill, cierre del SO.
-     * Desconecta todos los clientes limpiamente antes de morir.
-     */
     private void registerShutdownHook() {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-            if (logArea != null) {
-                logArea.append("\n[" + time + "]  ⚠ PROCESO TERMINADO EXTERNAMENTE\n");
-                logArea.append("[" + time + "]  ⚠ (Administrador de Tareas / Ctrl+C / kill)\n");
-                logArea.append("[" + time + "]  → Desconectando " + clients.size() + " cliente(s)...\n");
-            }
-            System.out.println("[" + time + "] [ShutdownHook] Proceso de clientes terminado externamente.");
-
             for (TCPClient c : clients) c.disconnect();
-
-            if (logArea != null)
-                logArea.append("[" + time + "]  ✔ Clientes desconectados. Proceso cerrado.\n");
-            System.out.println("[ShutdownHook] Clientes desconectados. Proceso cerrado.");
             try { Thread.sleep(300); } catch (InterruptedException ignored) {}
         }, "ShutdownHook-Client"));
     }
 
-    // ── Cabecera ─────────────────────────────────────────────
     private JPanel buildHeader() {
         JPanel p = new JPanel(new BorderLayout());
         p.setBackground(C_PURPLE);
@@ -108,7 +83,6 @@ public class ClientApp extends JFrame {
         return p;
     }
 
-    // ── Centro ───────────────────────────────────────────────
     private JPanel buildCenter() {
         JPanel p = new JPanel(new BorderLayout(0, 12));
         p.setBackground(C_WHITE);
@@ -117,7 +91,7 @@ public class ClientApp extends JFrame {
 
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
                 buildCards(), buildLog());
-        split.setDividerLocation(140);
+        split.setDividerLocation(160);
         split.setDividerSize(4);
         split.setBorder(null);
         split.setBackground(C_WHITE);
@@ -130,19 +104,37 @@ public class ClientApp extends JFrame {
         p.setLayout(new GridBagLayout());
         GridBagConstraints g = gbc();
 
-        hostField       = textField("localhost");
-        portSpinner     = spinner(8080, 1024, 65535);
-        numSpinner      = spinner(2, 1, 10);
-        retriesSpinner  = spinner(5, 1, 30);
-        intervalSpinner = spinner(3, 1, 30);
-        timeoutSpinner  = spinner(5, 1, 60);
+        hostField        = textField("localhost");
+        portSpinner      = spinner(8080, 1024, 65535);
+        numSpinner       = spinner(2, 1, 20);
+        retriesSpinner   = spinner(99, 1, 999);
+        intervalSpinner  = spinner(3, 1, 30);
+        timeoutSpinner   = spinner(5, 1, 60);
+        useBalancerCheck = new JCheckBox("Usar balanceador (failover automático)");
+        useBalancerCheck.setFont(font(12, false));
+        useBalancerCheck.setForeground(C_TEXT);
+        useBalancerCheck.setOpaque(false);
+        useBalancerCheck.setSelected(true);
+        useBalancerCheck.addActionListener(e -> {
+            boolean manual = !useBalancerCheck.isSelected();
+            hostField  .setEnabled(manual);
+            portSpinner.setEnabled(manual);
+        });
+        hostField  .setEnabled(false);
+        portSpinner.setEnabled(false);
 
-        addRow2(p, g, 0, "Host:",            hostField,
-                "Puerto:",           portSpinner);
-        addRow2(p, g, 1, "Núm. clientes:",   numSpinner,
+        addRow2(p, g, 0, "Host:",           hostField,
+                "Puerto:",          portSpinner);
+        addRow2(p, g, 1, "Núm. clientes:",  numSpinner,
                 "Máx. reintentos:", retriesSpinner);
-        addRow2(p, g, 2, "Intervalo (s):",   intervalSpinner,
+        addRow2(p, g, 2, "Intervalo (s):",  intervalSpinner,
                 "Timeout (s):",     timeoutSpinner);
+
+        GridBagConstraints fullRow = gbc();
+        fullRow.gridx = 0; fullRow.gridy = 3;
+        fullRow.gridwidth = 4; fullRow.weightx = 1;
+        p.add(useBalancerCheck, fullRow);
+
         return p;
     }
 
@@ -152,7 +144,7 @@ public class ClientApp extends JFrame {
 
         JScrollPane scroll = new JScrollPane(cardsPanel);
         scroll.setBorder(BorderFactory.createLineBorder(C_BORDER));
-        scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
+        scroll.getVerticalScrollBar().setUnitIncrement(10);
 
         JLabel lbl = new JLabel("Estado de clientes");
         lbl.setFont(font(12, true));
@@ -189,7 +181,6 @@ public class ClientApp extends JFrame {
         return p;
     }
 
-    // ── Botones ──────────────────────────────────────────────
     private JPanel buildButtons() {
         JButton launchBtn = actionBtn("▶  Lanzar clientes", C_GREEN);
         JButton stopBtn   = actionBtn("■  Detener todos",   C_RED);
@@ -202,42 +193,92 @@ public class ClientApp extends JFrame {
         JPanel p = new JPanel(new FlowLayout(FlowLayout.CENTER, 12, 12));
         p.setBackground(C_WHITE);
         p.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, C_BORDER));
-        p.add(launchBtn);
-        p.add(stopBtn);
-        p.add(clearBtn);
+        p.add(launchBtn); p.add(stopBtn); p.add(clearBtn);
         return p;
     }
 
-    // ── Lógica ───────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════
+    //  LÓGICA — lanzamiento con portResolver dinámico (FIXED)
+    // ════════════════════════════════════════════════════════
     private void launchClients() {
         int n        = (Integer) numSpinner.getValue();
         int retries  = (Integer) retriesSpinner.getValue();
         int interval = (Integer) intervalSpinner.getValue();
         int timeout  = (Integer) timeoutSpinner.getValue();
-        int port     = (Integer) portSpinner.getValue();
-        String host  = hostField.getText().trim();
+        boolean useBalancer = useBalancerCheck.isSelected();
 
-        log("Lanzando " + n + " cliente(s) → " + host + ":" + port
-                + "  [reintentos=" + retries
-                + ", intervalo=" + interval + "s"
-                + ", timeout=" + timeout + "s]");
+        log("Lanzando " + n + " cliente(s)"
+                + (useBalancer ? " vía balanceador (failover automático)"
+                : " → " + hostField.getText().trim()
+                + ":" + portSpinner.getValue()));
 
-        for (int i = 0; i < n; i++) {
-            clientCounter++;
-            String id = "C" + String.format("%02d", clientCounter);
-            ReconnectionPolicy pol = new ReconnectionPolicy(retries, interval, timeout);
-            TCPClient c = new TCPClient(id, host, port, pol, this::log);
-            JPanel card = buildCard(id);
-            c.setOnStateChange(st -> SwingUtilities.invokeLater(() -> {
-                updateCard(card, st);
-                updateSummary();
-            }));
-            clients.add(c);
-            cardsPanel.add(card);
-            cardsPanel.revalidate();
-            c.connect();
-        }
-        updateSummary();
+        new Thread(() -> {
+            for (int i = 0; i < n; i++) {
+                clientCounter++;
+                final String id = "C" + String.format("%02d", clientCounter);
+
+                final int    initialPort;
+                final String host;
+
+                if (useBalancer) {
+                    int assigned = BalancerClient.requestNextServer();
+                    if (assigned < 0) {
+                        log("[" + id + "] ✖ Sin servidores disponibles — cancelado.");
+                        clientCounter--;
+                        continue;
+                    }
+                    host        = "localhost";
+                    initialPort = assigned;
+                    log("[" + id + "] ⚖ Asignado → :" + assigned + " (round-robin)");
+                } else {
+                    host        = hostField.getText().trim();
+                    initialPort = (Integer) portSpinner.getValue();
+                }
+
+                ReconnectionPolicy pol = new ReconnectionPolicy(retries, interval, timeout);
+
+                // ── portResolver dinámico (FIXED) ────────────────────────────
+                // originalPort = puerto del primario asignado al cliente. NUNCA cambia.
+                // Siempre consultamos REDIRECT_TARGET con este puerto, no con el último
+                // puerto al que nos conectamos. Así, cuando el primario vuelve después
+                // de un failover, el balanceador devuelve el primario y el cliente
+                // regresa automáticamente (failback transparente).
+                final int originalPort = initialPort;
+                final int[] currentPort = { initialPort }; // solo para detectar cambios en UI
+
+                java.util.function.IntSupplier portResolver = () -> {
+                    if (!useBalancer) return originalPort;
+                    int resolved = BalancerClient.requestRedirectTarget(originalPort);
+                    // Notificar a la UI solo cuando el puerto destino cambia
+                    if (resolved > 0 && resolved != currentPort[0]) {
+                        currentPort[0] = resolved;
+                    }
+                    return resolved; // -1 si no hay servidor disponible
+                };
+
+                TCPClient c = new TCPClient(id, host, portResolver, pol, this::log);
+                JPanel card = buildCard(id, initialPort);
+
+                c.setOnStateChange(st -> SwingUtilities.invokeLater(() -> {
+                    updateCard(card, st);
+                    updateSummary();
+                }));
+
+                c.setOnPortChange(newPort -> SwingUtilities.invokeLater(() ->
+                        updateCardPort(card, newPort)));
+
+                final TCPClient finalC = c;
+                SwingUtilities.invokeLater(() -> {
+                    clients.add(finalC);
+                    cardsPanel.add(card);
+                    cardsPanel.revalidate();
+                    updateSummary();
+                });
+
+                c.connect();
+                try { Thread.sleep(80); } catch (InterruptedException ignored) {}
+            }
+        }, "ClientLauncher").start();
     }
 
     private void stopAllClients() {
@@ -250,27 +291,36 @@ public class ClientApp extends JFrame {
         summaryLbl.setText("Sin clientes activos");
     }
 
-    // ── Tarjeta de cliente ───────────────────────────────────
-    private JPanel buildCard(String id) {
-        JPanel card = new JPanel(new BorderLayout(2, 4));
+    private JPanel buildCard(String id, int port) {
+        JPanel card = new JPanel(new BorderLayout(2, 2));
         card.setBackground(C_WHITE);
         card.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(C_BORDER, 2),
-                new EmptyBorder(8, 14, 8, 14)
+                new EmptyBorder(6, 12, 6, 12)
         ));
-        card.setPreferredSize(new Dimension(110, 72));
+        card.setPreferredSize(new Dimension(118, 86));
 
         JLabel idLbl = new JLabel(id, SwingConstants.CENTER);
-        idLbl.setFont(font(16, true));
+        idLbl.setFont(font(15, true));
         idLbl.setForeground(C_PURPLE);
+
+        JLabel portLbl = new JLabel("→ :" + port, SwingConstants.CENTER);
+        portLbl.setName("port");
+        portLbl.setFont(font(10, false));
+        portLbl.setForeground(C_TEAL);
 
         JLabel stLbl = new JLabel("Iniciando", SwingConstants.CENTER);
         stLbl.setName("state");
         stLbl.setFont(font(10, false));
         stLbl.setForeground(C_ORANGE);
 
+        JPanel south = new JPanel(new GridLayout(2, 1, 0, 1));
+        south.setOpaque(false);
+        south.add(portLbl);
+        south.add(stLbl);
+
         card.add(idLbl, BorderLayout.CENTER);
-        card.add(stLbl, BorderLayout.SOUTH);
+        card.add(south, BorderLayout.SOUTH);
         return card;
     }
 
@@ -286,41 +336,44 @@ public class ClientApp extends JFrame {
         findLabel(card, "state", text, textColor);
         card.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(border, 2),
-                new EmptyBorder(8, 14, 8, 14)
+                new EmptyBorder(6, 12, 6, 12)
         ));
     }
 
-    /** Actualiza el resumen en la cabecera con conteos por estado. */
-    private void updateSummary() {
-        long connected  = clients.stream().filter(c -> c.getState() == TCPClient.State.CONNECTED).count();
-        long retrying   = clients.stream().filter(c -> c.getState() == TCPClient.State.RETRYING).count();
-        long failed     = clients.stream().filter(c -> c.getState() == TCPClient.State.FAILED).count();
-        long total      = clients.size();
-
-        if (total == 0) {
-            summaryLbl.setText("Sin clientes activos");
-        } else {
-            summaryLbl.setText(
-                    total + " clientes  ·  "
-                            + connected + " conectados  ·  "
-                            + retrying  + " reintentando  ·  "
-                            + failed    + " fallidos"
-            );
-        }
-    }
-
-    private void findLabel(Container c, String name, String text, Color color) {
-        for (Component comp : c.getComponents()) {
-            if (comp instanceof JLabel && name.equals(comp.getName())) {
-                ((JLabel) comp).setText(text);
-                ((JLabel) comp).setForeground(color);
-            } else if (comp instanceof Container) {
-                findLabel((Container) comp, name, text, color);
+    private void updateCardPort(JPanel card, int newPort) {
+        for (java.awt.Component comp : card.getComponents()) {
+            if (comp instanceof JPanel) {
+                for (java.awt.Component inner : ((JPanel) comp).getComponents()) {
+                    if (inner instanceof JLabel && "port".equals(inner.getName())) {
+                        ((JLabel) inner).setText("→ :" + newPort);
+                        ((JLabel) inner).setForeground(C_ORANGE);
+                    }
+                }
             }
         }
     }
 
-    // ── Helpers UI ───────────────────────────────────────────
+    private void updateSummary() {
+        long connected = clients.stream().filter(c -> c.getState() == TCPClient.State.CONNECTED).count();
+        long retrying  = clients.stream().filter(c -> c.getState() == TCPClient.State.RETRYING).count();
+        long failed    = clients.stream().filter(c -> c.getState() == TCPClient.State.FAILED).count();
+        long total     = clients.size();
+        summaryLbl.setText(total == 0 ? "Sin clientes activos"
+                : total + " clientes  ·  " + connected + " conectados  ·  "
+                + retrying + " reintentando  ·  " + failed + " fallidos");
+    }
+
+    private void findLabel(java.awt.Container c, String name, String text, Color color) {
+        for (java.awt.Component comp : c.getComponents()) {
+            if (comp instanceof JLabel && name.equals(comp.getName())) {
+                ((JLabel) comp).setText(text);
+                ((JLabel) comp).setForeground(color);
+            } else if (comp instanceof java.awt.Container) {
+                findLabel((java.awt.Container) comp, name, text, color);
+            }
+        }
+    }
+
     private JPanel sectionPanel(String title) {
         JPanel p = new JPanel();
         p.setBackground(new Color(248, 249, 253));
@@ -367,8 +420,7 @@ public class ClientApp extends JFrame {
         f.setFont(font(12, false));
         f.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(C_BORDER),
-                new EmptyBorder(3, 6, 3, 6)
-        ));
+                new EmptyBorder(3, 6, 3, 6)));
         return f;
     }
 
@@ -401,7 +453,6 @@ public class ClientApp extends JFrame {
         return new Font("SansSerif", bold ? Font.BOLD : Font.PLAIN, size);
     }
 
-    // ── Main ─────────────────────────────────────────────────
     public static void main(String[] args) {
         System.setProperty("awt.useSystemAAFontSettings", "on");
         System.setProperty("swing.aatext", "true");
