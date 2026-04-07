@@ -24,10 +24,20 @@ public class ServerApp extends JFrame {
 
     private TCPServer             server;
     private javax.swing.Timer     clientCountTimer;
-    private javax.swing.Timer     statusMonitorTimer; // ← nuevo: vigila si hay que hacer failback
+    private javax.swing.Timer     statusMonitorTimer;
     private RestartPolicy         policy;
     private boolean               isStandbyMode = false;
     private int                   myPort        = -1;
+
+    /**
+     * FIX PRINCIPAL:
+     * - failbackStop: cuando true, onStopped NO cierra ventana ni desregistra.
+     *   Solo relanza el TCPServer interno (sin parpadeo de ventana).
+     * - isCurrentlyActive: el standby SOLO hace failback si realmente llegó
+     *   a estar ACTIVE. Evita el ciclo de stop/relaunch antes de activarse.
+     */
+    private volatile boolean failbackStop      = false;
+    private volatile boolean isCurrentlyActive = false;
 
     private JLabel            statusPill;
     private JLabel            modePill;
@@ -174,7 +184,6 @@ public class ServerApp extends JFrame {
         addRow(p, g, 3, "Delay reinicio (s):",   delaySpinner);
         addRow(p, g, 4, "Máx. reinicios:",       maxRestartsSpinner);
 
-        // primaryPortSpinner ya no se usa — standby es genérico
         primaryPortSpinner.setVisible(false);
         primaryPortSpinner.setEnabled(false);
 
@@ -284,17 +293,19 @@ public class ServerApp extends JFrame {
 
     private void launchServer(RestartPolicy pol, int port,
                               boolean standby, int ignoredPrimaryPort) {
-        myPort        = port;
-        isStandbyMode = standby;
-        server        = new TCPServer(port, this::log);
+        myPort            = port;
+        isStandbyMode     = standby;
+        failbackStop      = false;   // resetear siempre al lanzar
+        isCurrentlyActive = false;   // resetear siempre al lanzar
+        server            = new TCPServer(port, this::log);
 
         server.setOnStarted(() -> SwingUtilities.invokeLater(() -> {
             if (standby) {
                 setPill(modePill, "STANDBY", C_TEAL);
                 new Thread(() -> BalancerClient.registerStandby(port),
                         "Balancer-RegStandby").start();
-                log("⏸ Registrado como standby genérico");
-                startStatusMonitor(port); // ← inicia el monitor de estado
+                log("⏸ Registrado como standby genérico — esperando activación...");
+                startStatusMonitor(port, pol);
             } else {
                 setPill(modePill, "PRIMARIO", C_BLUE.darker());
                 new Thread(() -> BalancerClient.register(port),
@@ -311,7 +322,30 @@ public class ServerApp extends JFrame {
         }));
 
         server.setOnStopped(() -> SwingUtilities.invokeLater(() -> {
-            stopTimers();
+
+            // Parar solo clientCountTimer; el statusMonitorTimer
+            // ya fue parado por el propio monitor antes de llamar server.stop()
+            // (en el caso failback). En casos normales también lo paramos.
+            stopClientTimer();
+            stopStatusTimer();
+
+            // ── Caso FAILBACK: volver a standby sin cerrar ventana ──────────
+            // Solo se activa si el standby estuvo ACTIVE y el primario volvió.
+            if (failbackStop) {
+                failbackStop      = false;
+                isCurrentlyActive = false;
+                // NO desregistrar del balanceador: el balanceador ya sabe
+                // que volvemos a STANDBY y nos mantendrá disponibles.
+                log("⏸ Standby listo para cubrir la próxima caída.");
+                javax.swing.Timer relaunchTimer = new javax.swing.Timer(300,
+                        e -> launchServer(pol, port, true, -1));
+                relaunchTimer.setRepeats(false);
+                relaunchTimer.start();
+                return;
+            }
+
+            // ── Caso normal: caída real o detención manual ───────────────────
+            // Desregistrar del balanceador (ya no está disponible)
             new Thread(() -> BalancerClient.unregister(port), "Balancer-Unreg").start();
 
             if (pol.shouldRestart()) {
@@ -345,7 +379,7 @@ public class ServerApp extends JFrame {
         }));
 
         // Timer de refresco de clientes
-        if (clientCountTimer != null) clientCountTimer.stop();
+        stopClientTimer();
         clientCountTimer = new javax.swing.Timer(800, e -> {
             if (server != null && server.isRunning()) {
                 int count = server.clientCount();
@@ -363,14 +397,18 @@ public class ServerApp extends JFrame {
      * Monitor de estado para servidores standby.
      *
      * Consulta STATUS al balanceador cada segundo.
-     * Mientras el balanceador diga ACTIVE → sigue sirviendo normalmente.
-     * En cuanto diga STANDBY → el primario se recuperó: detener el TCPServer
-     * para cortar todas las conexiones activas. Los clientes detectarán la
-     * desconexión, consultarán REDIRECT_TARGET a su puerto original y el
-     * balanceador les devolverá el primario. Failback transparente.
+     *
+     * FIX CLAVE — isCurrentlyActive:
+     *   El standby arranca en estado STANDBY. El balanceador responde "STANDBY"
+     *   hasta que lo activa. Si hacemos failback con la primera respuesta STANDBY,
+     *   el servidor entra en un ciclo de stop/relaunch antes de servir a nadie.
+     *
+     *   La bandera isCurrentlyActive garantiza que el failback solo ocurre cuando
+     *   el standby ya estuvo ACTIVE y el balanceador volvió a decir STANDBY
+     *   (señal de que el primario se recuperó).
      */
-    private void startStatusMonitor(int port) {
-        if (statusMonitorTimer != null) statusMonitorTimer.stop();
+    private void startStatusMonitor(int port, RestartPolicy pol) {
+        stopStatusTimer();
 
         statusMonitorTimer = new javax.swing.Timer(1000, e -> {
             if (server == null || !server.isRunning()) return;
@@ -380,48 +418,57 @@ public class ServerApp extends JFrame {
 
                 SwingUtilities.invokeLater(() -> {
                     if ("ACTIVE".equals(status)) {
-                        // Seguimos cubriendo al primario caído — actualizar pill
+                        // ── El balanceador nos activó: estamos cubriendo un primario caído ──
+                        if (!isCurrentlyActive) {
+                            isCurrentlyActive = true;
+                            log("▶ Standby ACTIVADO — cubriendo primario caído.");
+                        }
                         setPill(modePill, "ACTIVO", C_ORANGE);
                         setPill(statusPill, "ONLINE", C_GREEN);
 
                     } else if ("STANDBY".equals(status)) {
-                        // El primario se recuperó — dejar de servir para que
-                        // los clientes migren de vuelta
+                        // ── Solo hacer failback si realmente estuvimos ACTIVE ──
+                        // Si isCurrentlyActive == false, aún no nos han activado:
+                        // simplemente seguimos esperando (no hacer nada).
+                        if (!isCurrentlyActive) {
+                            // Todavía en espera inicial — ignorar respuesta STANDBY
+                            setPill(modePill, "STANDBY", C_TEAL);
+                            return;
+                        }
+
+                        // Primario recuperado → hacer failback
                         log("↩ Primario recuperado — cediendo clientes y volviendo a standby...");
                         setPill(modePill, "STANDBY", C_TEAL);
 
-                        // Detener el TCPServer corta las conexiones activas.
-                        // server.stop() dispara onStopped → goOffline() porque
-                        // pol.shouldRestart() = false en este contexto.
-                        // Por eso marcamos que es una parada "voluntaria de failback"
-                        // y relanzamos inmediatamente como standby en espera.
-                        if (statusMonitorTimer != null) {
-                            statusMonitorTimer.stop();
-                            statusMonitorTimer = null;
-                        }
+                        // Parar monitor ANTES de detener servidor
+                        stopStatusTimer();
 
-                        // Detener el servidor (corta conexiones → clientes reconectan al primario)
-                        new Thread(() -> {
-                            server.stop();
-                            // Pequeña pausa para que los clientes detecten la desconexión
-                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                            // Volver a arrancar como standby en espera (sin clientes)
-                            SwingUtilities.invokeLater(() -> {
-                                log("⏸ Standby listo para cubrir la próxima caída.");
-                                launchServer(policy, port, true, -1);
-                            });
-                        }, "Failback-Restart").start();
+                        // Marcar como failback para que onStopped no cierre ventana
+                        failbackStop = true;
+
+                        new Thread(server::stop, "Failback-Stop").start();
+
                     }
-                    // Si status es UNKNOWN (balanceador caído), no hacer nada
+                    // Si status es null/UNKNOWN (balanceador caído): no hacer nada
                 });
             }, "StatusMonitor").start();
         });
         statusMonitorTimer.start();
     }
 
-    private void stopTimers() {
-        if (clientCountTimer  != null) { clientCountTimer.stop();  clientCountTimer  = null; }
-        if (statusMonitorTimer != null) { statusMonitorTimer.stop(); statusMonitorTimer = null; }
+    // ── Gestión de timers ─────────────────────────────────────
+    private void stopClientTimer() {
+        if (clientCountTimer != null) {
+            clientCountTimer.stop();
+            clientCountTimer = null;
+        }
+    }
+
+    private void stopStatusTimer() {
+        if (statusMonitorTimer != null) {
+            statusMonitorTimer.stop();
+            statusMonitorTimer = null;
+        }
     }
 
     private void goOffline() {
@@ -442,7 +489,7 @@ public class ServerApp extends JFrame {
 
     private void stopServer() {
         log("■ Deteniendo servidor...");
-        if (statusMonitorTimer != null) { statusMonitorTimer.stop(); statusMonitorTimer = null; }
+        stopStatusTimer();
         if (server != null) server.stop();
     }
 
